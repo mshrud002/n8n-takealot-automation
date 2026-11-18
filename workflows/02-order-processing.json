@@ -1,0 +1,349 @@
+{
+  "name": "02 - Order Processing",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/15 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "fdc3c681d496abf3",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\n        const since = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);\n        return [{ json: {\n          start_date: since.toISOString().slice(0, 10),\n          end_date: now.toISOString().slice(0, 10),\n          report_date: now.toISOString().slice(0, 10)\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "83abdfc58cc97370",
+      "name": "Date Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.TAKEALOT_API_BASE_URL }}/v1/sales/orders",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.TAKEALOT_API_KEY }}"
+            }
+          ]
+        },
+        "sendQueryParameters": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "start_date",
+              "value": "={{ $json.start_date }}"
+            },
+            {
+              "name": "end_date",
+              "value": "={{ $json.end_date }}"
+            }
+          ]
+        }
+      },
+      "id": "96b89de4692951b0",
+      "name": "Fetch Sales Orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\n        const orders = body.orders || body.data?.orders || body.sales_orders || [];\n        const rows = [];\n        for (const o of orders) {\n          const items = o.order_items || o.items || o.line_items || [o];\n          for (const it of items) {\n            rows.push({ json: {\n              order_id: Number(o.order_id || o.id || 0),\n              order_item_id: Number(it.order_item_id || it.id || 0),\n              sku: String(it.sku || it.merchant_sku || ''),\n              product_title: String(it.product_title || it.title || o.product_title || ''),\n              quantity: Number(it.quantity || 1),\n              item_price: Number(it.item_price || it.price || 0),\n              status: String(o.order_status || o.status || ''),\n              created_at: o.created_at || o.order_date || new Date().toISOString(),\n              raw: JSON.stringify(o).slice(0, 8000).replace(/'/g, \"''\")\n            }});\n          }\n        }\n        return rows;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "65ada5567f717b75",
+      "name": "Normalize Orders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO orders (order_id, order_item_id, sku, product_title, quantity, item_price, status, created_at, raw)\n        VALUES ({{ $json.order_id }}, {{ $json.order_item_id }}, '{{ $json.sku }}',\n                '{{ $json.product_title.replace(/'/g, \"''\") }}', {{ $json.quantity }},\n                {{ $json.item_price }}, '{{ $json.status }}', '{{ $json.created_at }}',\n                '{{ $json.raw }}'::jsonb)\n        ON CONFLICT (order_id, order_item_id) DO UPDATE SET\n          quantity = EXCLUDED.quantity,\n          item_price = EXCLUDED.item_price,\n          status = EXCLUDED.status,\n          raw = EXCLUDED.raw,\n          imported_at = now()",
+        "options": {}
+      },
+      "id": "de6afdef01050258",
+      "name": "Upsert Orders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $('Normalize Orders').all().map(i => i.json);\n        const revenue = rows.reduce((s, r) => s + r.item_price * r.quantity, 0);\n        return [{ json: {\n          count: rows.length,\n          revenue: Math.round(revenue * 100) / 100,\n          rows: rows.slice(0, 25),\n          date: new Date().toISOString().slice(0, 10)\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "ffe758fe12447f3a",
+      "name": "Order Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "rule-1",
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "56b43b36f30b6786",
+      "name": "Any New Orders?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {},
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'New Takealot orders: ' + $json.count + ' | Revenue: R' + $json.revenue }) }}"
+      },
+      "id": "9224a71c249277c1",
+      "name": "Notify New Orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_FROM_EMAIL }}",
+        "toEmail": "={{ $env.ALERT_EMAIL }}",
+        "subject": "={{ 'Takealot order digest - ' + $json.date }}",
+        "emailFormat": "html",
+        "html": "={{ '<h2>' + $json.count + ' new orders</h2><table border=1 cellpadding=4><tr><th>Order</th><th>SKU</th><th>Qty</th><th>Price</th></tr>' + $json.rows.map(r => '<tr><td>' + r.order_id + '</td><td>' + r.sku + '</td><td>' + r.quantity + '</td><td>R' + r.item_price + '</td></tr>').join('') + '</table>' }}",
+        "options": {}
+      },
+      "id": "78e0d89ae994b7af",
+      "name": "Email Order Digest",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1760,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.xero.com/api.xro/2.0/Invoices",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Xero-tenant-id",
+              "value": "={{ $env.XERO_TENANT_ID }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({\n          Type: 'ACCREC',\n          Contact: { Name: 'Takealot Marketplace' },\n          Date: $json.date,\n          DueDate: $json.date,\n          Reference: 'TAKEALOT-' + $json.date,\n          LineItems: $json.rows.map(r => ({\n            Description: (r.sku || '') + ' - ' + (r.product_title || ''),\n            Quantity: r.quantity,\n            UnitAmount: r.item_price,\n            AccountCode: '400'\n          }))\n        }) }}",
+        "authentication": "oAuth2"
+      },
+      "id": "55f757e1f7d82427",
+      "name": "Xero Create Invoice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        -120
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "65c2dc8c1e6a8eac",
+      "name": "No New Orders",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        180
+      ]
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Date Window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Date Window": {
+      "main": [
+        [
+          {
+            "node": "Fetch Sales Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Sales Orders": {
+      "main": [
+        [
+          {
+            "node": "Normalize Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Orders": {
+      "main": [
+        [
+          {
+            "node": "Upsert Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Orders": {
+      "main": [
+        [
+          {
+            "node": "Order Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Order Summary": {
+      "main": [
+        [
+          {
+            "node": "Any New Orders?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any New Orders?": {
+      "main": [
+        [
+          {
+            "node": "Notify New Orders",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No New Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify New Orders": {
+      "main": [
+        [
+          {
+            "node": "Email Order Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Order Digest": {
+      "main": [
+        [
+          {
+            "node": "Xero Create Invoice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1831b40e-ee7e-b05e-66c6-208acf2b2c89",
+  "meta": {},
+  "id": "786cb2c562b242ac",
+  "tags": [],
+  "pinData": {}
+}

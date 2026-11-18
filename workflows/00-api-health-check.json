@@ -1,0 +1,116 @@
+{
+  "name": "00 - Takealot API Health Check",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "3f155722b87b76ee",
+      "name": "Run Health Check",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.TAKEALOT_API_BASE_URL }}/{{ $env.TAKEALOT_API_VERSION }}/offers/count",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.TAKEALOT_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "id": "90b4f4575e9ad719",
+      "name": "Check Offers Count",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\n        return [{ json: {\n          ok: true,\n          offer_count: body.count ?? body.total ?? 0,\n          raw: JSON.stringify(body).slice(0, 500)\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "ac193c71faf023ae",
+      "name": "Summarise Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {},
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'Takealot API health check OK. Offers: ' + $json.offer_count }) }}"
+      },
+      "id": "c537affd547dd5f6",
+      "name": "Notify Health Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Run Health Check": {
+      "main": [
+        [
+          {
+            "node": "Check Offers Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Offers Count": {
+      "main": [
+        [
+          {
+            "node": "Summarise Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise Result": {
+      "main": [
+        [
+          {
+            "node": "Notify Health Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "8df59aeb-b17b-13d7-c45e-69c004537114",
+  "meta": {},
+  "id": "acf158efdcfd19ca",
+  "tags": [],
+  "pinData": {}
+}

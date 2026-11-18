@@ -1,0 +1,354 @@
+{
+  "name": "01 - Price & Competitor Monitoring",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "928e9a45871d5575",
+      "name": "Daily 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.TAKEALOT_API_BASE_URL }}/{{ $env.TAKEALOT_API_VERSION }}/offers",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.TAKEALOT_API_KEY }}"
+            }
+          ]
+        },
+        "sendQueryParameters": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "page_number",
+              "value": "1"
+            },
+            {
+              "name": "page_size",
+              "value": "100"
+            }
+          ]
+        }
+      },
+      "id": "ca2ddc0cb6b19d90",
+      "name": "Fetch My Offers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\n        const offers = body.offers || body.data?.offers || body.results || [];\n        return offers.map(o => ({ json: {\n          offer_id: Number(o.offer_id || o.id || 0),\n          sku: String(o.sku || o.merchant_sku || '').trim(),\n          product_title: String(o.title || o.product_title || ''),\n          selling_price: Number(o.selling_price || 0),\n          rrp: Number(o.rrp || 0),\n          cost_price: Number(o.cost_price || 0),\n          stock_total: Number(o.stock_total ?? o.seller_stock ?? 0)\n        }}));",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "7f0034f5654f8b19",
+      "name": "Normalize Offers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO offers (offer_id, sku, product_title, selling_price, rrp, stock_total, updated_at)\n        VALUES (\n          {{ $json.offer_id }},\n          '{{ $json.sku }}',\n          '{{ $json.product_title.replace(/'/g, \"''\") }}',\n          {{ $json.selling_price }},\n          {{ $json.rrp }},\n          {{ $json.stock_total }},\n          now()\n        )\n        ON CONFLICT (sku) DO UPDATE SET\n          offer_id = EXCLUDED.offer_id,\n          product_title = EXCLUDED.product_title,\n          selling_price = EXCLUDED.selling_price,\n          rrp = EXCLUDED.rrp,\n          stock_total = EXCLUDED.stock_total,\n          updated_at = now()",
+        "options": {}
+      },
+      "id": "04d88276a656f574",
+      "name": "Upsert Offers",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_COMPETITORS_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "CompetitorPrices",
+          "mode": "name"
+        },
+        "options": {},
+        "dataLocationOnSheet": {
+          "rangeDefinition": "detectAutomatically"
+        }
+      },
+      "id": "0b94008e26d6f318",
+      "name": "Competitor Prices",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const offers = $('Normalize Offers').all().map(i => i.json);\n        const comps = $input.all().map(i => i.json);\n        const bySku = {};\n        for (const c of comps) {\n          const sku = String(c.sku || '').trim();\n          if (sku) bySku[sku] = Number(c.competitor_price || c.price || 0);\n        }\n        const undercut = Number($env.PRICE_UNDERCUT_CENTS || 100) / 100;\n        const margin = Number($env.PRICE_MIN_MARGIN_PERCENT || 15) / 100;\n        const round2 = n => Math.round(n * 100) / 100;\n        const out = [];\n        for (const o of offers) {\n          const cp = bySku[o.sku];\n          if (!cp) continue;\n          const target = round2(Math.max(1, cp - undercut));\n          const floor = round2(o.cost_price * (1 + margin));\n          const recommended = Math.max(target, floor);\n          const action = recommended < o.selling_price ? 'lower'\n            : recommended > o.selling_price ? 'raise' : 'hold';\n          out.push({ json: {\n            offer_id: o.offer_id,\n            sku: o.sku,\n            current_price: o.selling_price,\n            competitor_price: cp,\n            cost_price: o.cost_price,\n            recommended_price: recommended,\n            action\n          }});\n        }\n        return out;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "c6352be1c2e022de",
+      "name": "Build Price Decisions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "rule-1",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "hold",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "67731aba54171e21",
+      "name": "Needs Reprice?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.TAKEALOT_API_BASE_URL }}/{{ $env.TAKEALOT_API_VERSION }}/offers/SKU{{ $json.sku }}",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.TAKEALOT_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ offer: { selling_price: $json.recommended_price } }) }}"
+      },
+      "id": "520625ce3e30aa02",
+      "name": "Patch Offer Price",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO price_history (sku, offer_id, selling_price, competitor_price, recommended_price, action)\n        VALUES ('{{ $json.sku }}', {{ $json.offer_id }}, {{ $json.current_price }},\n                {{ $json.competitor_price }}, {{ $json.recommended_price }}, '{{ $json.action }}')",
+        "options": {}
+      },
+      "id": "e84f82499e79e5e5",
+      "name": "Log Price History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {},
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'Repriced ' + $json.sku + ': R' + $json.current_price + ' -> R' + $json.recommended_price + ' (' + $json.action + ') }) }}"
+      },
+      "id": "749793fc462734c7",
+      "name": "Alert Reprices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        -120
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "36fe89f9845d2d3f",
+      "name": "No Reprice Needed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        180
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 06:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch My Offers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch My Offers": {
+      "main": [
+        [
+          {
+            "node": "Normalize Offers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Offers": {
+      "main": [
+        [
+          {
+            "node": "Upsert Offers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Offers": {
+      "main": [
+        [
+          {
+            "node": "Competitor Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Competitor Prices": {
+      "main": [
+        [
+          {
+            "node": "Build Price Decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Price Decisions": {
+      "main": [
+        [
+          {
+            "node": "Needs Reprice?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Reprice?": {
+      "main": [
+        [
+          {
+            "node": "Patch Offer Price",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Reprice Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Patch Offer Price": {
+      "main": [
+        [
+          {
+            "node": "Log Price History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Price History": {
+      "main": [
+        [
+          {
+            "node": "Alert Reprices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "7b384b1e-cca3-eb37-fee6-1d7381f264b0",
+  "meta": {},
+  "id": "5b0cf642f35f630c",
+  "tags": [],
+  "pinData": {}
+}

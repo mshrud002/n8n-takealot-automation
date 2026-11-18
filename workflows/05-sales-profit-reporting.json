@@ -1,0 +1,346 @@
+{
+  "name": "05 - Sales & Profit Reporting",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "fe62dba68649c848",
+      "name": "Daily 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\n        const y = new Date(now.getTime() - 24 * 60 * 60 * 1000);\n        return [{ json: {\n          start_date: y.toISOString().slice(0, 10),\n          end_date: y.toISOString().slice(0, 10),\n          report_date: y.toISOString().slice(0, 10)\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "5bf7739cb1decf8f",
+      "name": "Yesterday Range",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.TAKEALOT_API_BASE_URL }}/{{ $env.TAKEALOT_API_VERSION }}/sales",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.TAKEALOT_API_KEY }}"
+            }
+          ]
+        },
+        "sendQueryParameters": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "start_date",
+              "value": "={{ $json.start_date }}"
+            },
+            {
+              "name": "end_date",
+              "value": "={{ $json.end_date }}"
+            }
+          ]
+        }
+      },
+      "id": "dc1cc98ff7bb32b8",
+      "name": "Fetch Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\n        const sales = body.sales || body.data?.sales || body.results || [];\n        return sales.map(s => ({ json: {\n          sale_id: Number(s.sale_id || s.id || 0),\n          sku: String(s.sku || s.merchant_sku || ''),\n          offer_id: Number(s.offer_id || 0),\n          quantity: Number(s.quantity || s.units || 0),\n          revenue: Number(s.revenue || s.total || s.item_price || 0),\n          fees: Number(s.fees || s.commission || 0),\n          sale_date: String(s.sale_date || s.date || $('Yesterday Range').first().json.report_date).slice(0, 10),\n          raw: JSON.stringify(s).slice(0, 8000).replace(/'/g, \"''\")\n        }}));",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "a8a6970c238c118b",
+      "name": "Normalize Sales",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sales (sale_id, sku, offer_id, quantity, revenue, fees, sale_date, raw)\n        VALUES ({{ $json.sale_id }}, '{{ $json.sku }}', {{ $json.offer_id }}, {{ $json.quantity }},\n                {{ $json.revenue }}, {{ $json.fees }}, '{{ $json.sale_date }}', '{{ $json.raw }}'::jsonb)\n        ON CONFLICT (sale_id) DO UPDATE SET\n          revenue = EXCLUDED.revenue,\n          fees = EXCLUDED.fees,\n          quantity = EXCLUDED.quantity,\n          raw = EXCLUDED.raw,\n          imported_at = now()",
+        "options": {}
+      },
+      "id": "ce1f66398bf6b2d2",
+      "name": "Upsert Sales",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_CATALOGUE_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Catalogue",
+          "mode": "name"
+        },
+        "options": {},
+        "dataLocationOnSheet": {
+          "rangeDefinition": "detectAutomatically"
+        }
+      },
+      "id": "5493a5004f627fd9",
+      "name": "Cost Prices",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sales = $('Normalize Sales').all().map(i => i.json);\n        const costs = {};\n        for (const c of $input.all().map(i => i.json)) {\n          const sku = String(c.sku || '').trim();\n          if (sku) costs[sku] = Number(c.cost_price || c.cost || 0);\n        }\n        let revenue = 0, fees = 0, cogs = 0;\n        for (const s of sales) {\n          revenue += Number(s.revenue || 0);\n          fees += Number(s.fees || 0);\n          cogs += (costs[s.sku] || 0) * Number(s.quantity || 0);\n        }\n        const r2 = n => Math.round(n * 100) / 100;\n        return [{ json: {\n          report_date: sales[0]?.sale_date || $('Yesterday Range').first().json.report_date,\n          revenue: r2(revenue),\n          fees: r2(fees),\n          cogs: r2(cogs),\n          profit: r2(revenue - fees - cogs),\n          orders: sales.length\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "ff109234b3f0c180",
+      "name": "Compute Daily Profit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO profit_daily (report_date, revenue, fees, cogs, profit, updated_at)\n        VALUES ('{{ $json.report_date }}', {{ $json.revenue }}, {{ $json.fees }},\n                {{ $json.cogs }}, {{ $json.profit }}, now())\n        ON CONFLICT (report_date) DO UPDATE SET\n          revenue = EXCLUDED.revenue,\n          fees = EXCLUDED.fees,\n          cogs = EXCLUDED.cogs,\n          profit = EXCLUDED.profit,\n          updated_at = now()",
+        "options": {}
+      },
+      "id": "f3d69977c3bb80e8",
+      "name": "Save Daily Profit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_REPORT_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "DailyReport",
+          "mode": "name"
+        },
+        "options": {},
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        }
+      },
+      "id": "79b7a8752f989e0e",
+      "name": "Append Report Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {},
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'Daily report ' + $json.report_date + ': revenue R' + $json.revenue + ', fees R' + $json.fees + ', COGS R' + $json.cogs + ', profit R' + $json.profit }) }}"
+      },
+      "id": "3b892ab0c9bcf375",
+      "name": "Notify Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_FROM_EMAIL }}",
+        "toEmail": "={{ $env.ALERT_EMAIL }}",
+        "subject": "={{ 'Takealot profit report - ' + $json.report_date }}",
+        "emailFormat": "html",
+        "html": "={{ '<h2>' + $json.report_date + '</h2><p>Revenue: R' + $json.revenue + '<br>Fees: R' + $json.fees + '<br>COGS: R' + $json.cogs + '<br><b>Profit: R' + $json.profit + '</b></p>' }}",
+        "options": {}
+      },
+      "id": "7902e31315f073ef",
+      "name": "Email Report",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2200,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 07:00": {
+      "main": [
+        [
+          {
+            "node": "Yesterday Range",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Yesterday Range": {
+      "main": [
+        [
+          {
+            "node": "Fetch Sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Sales": {
+      "main": [
+        [
+          {
+            "node": "Normalize Sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Sales": {
+      "main": [
+        [
+          {
+            "node": "Upsert Sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Sales": {
+      "main": [
+        [
+          {
+            "node": "Cost Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cost Prices": {
+      "main": [
+        [
+          {
+            "node": "Compute Daily Profit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Daily Profit": {
+      "main": [
+        [
+          {
+            "node": "Save Daily Profit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Daily Profit": {
+      "main": [
+        [
+          {
+            "node": "Append Report Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Report Row": {
+      "main": [
+        [
+          {
+            "node": "Notify Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Report": {
+      "main": [
+        [
+          {
+            "node": "Email Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5fd2f316-4127-e4d2-9f8f-5975aecb571b",
+  "meta": {},
+  "id": "f2b2b19b9ace2a69",
+  "tags": [],
+  "pinData": {}
+}

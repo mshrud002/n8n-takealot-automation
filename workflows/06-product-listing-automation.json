@@ -1,0 +1,481 @@
+{
+  "name": "06 - Product Listing Automation",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "96e0c50b01ea3711",
+      "name": "Run Listing Batch",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_CATALOGUE_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Listings",
+          "mode": "name"
+        },
+        "options": {},
+        "dataLocationOnSheet": {
+          "rangeDefinition": "detectAutomatically"
+        }
+      },
+      "id": "15663d7b151cc913",
+      "name": "Read Listing Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json);\n        const warehouse = Number($env.TAKEALOT_WAREHOUSE_ID || 1);\n        const out = [];\n        for (const r of rows) {\n          const sku = String(r.sku || '').trim();\n          const price = Number(r.selling_price || 0);\n          const qty = Number(r.quantity || 0);\n          if (!sku || price <= 0 || qty <= 0) continue;\n          out.push({ json: {\n            sku,\n            selling_price: price,\n            rrp: Number(r.rrp || price),\n            leadtime_days: Number(r.leadtime_days || 0),\n            leadtime_stock: [{ merchant_warehouse_id: warehouse, quantity: qty }],\n            barcode: String(r.barcode || '')\n          }});\n        }\n        return out;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "d10df5aeb6f5f414",
+      "name": "Validate Listings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $('Read Listing Queue').all().map(i => i.json);\n        const bad = rows.filter(r => !String(r.sku || '').trim() || Number(r.selling_price || 0) <= 0 || Number(r.quantity || 0) <= 0);\n        return bad.map(r => ({ json: {\n          sku: String(r.sku || ''),\n          error: 'sku, selling_price and quantity must be valid',\n          raw: JSON.stringify(r).slice(0, 2000)\n        }}));",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "08c61da1716a8630",
+      "name": "Collect Rejections",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO listing_queue (sku, barcode, selling_price, rrp, quantity, warehouse_id, status)\n        VALUES ('{{ $json.sku }}', '{{ $json.barcode }}', {{ $json.selling_price }}, {{ $json.rrp }},\n                {{ $json.leadtime_stock[0].quantity }}, {{ $json.leadtime_stock[0].merchant_warehouse_id }}, 'pending')",
+        "options": {}
+      },
+      "id": "5bfb7e53d714bec1",
+      "name": "Log Queue Items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TAKEALOT_API_BASE_URL }}/{{ $env.TAKEALOT_API_VERSION }}/offers/batch",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.TAKEALOT_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ offers: $('Validate Listings').all().map(i => i.json).map(o => ({\n          sku: o.sku,\n          selling_price: o.selling_price,\n          rrp: o.rrp,\n          leadtime_days: o.leadtime_days,\n          leadtime_stock: o.leadtime_stock\n        })) }) }}"
+      },
+      "id": "e08197fead4cb517",
+      "name": "Submit Offer Batch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\n        return [{ json: {\n          batch_id: String(body.batch_id || body.id || body.batchId || ''),\n          submitted_at: new Date().toISOString()\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "aa72e34ccee76af6",
+      "name": "Extract Batch Id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 30,
+        "unit": "seconds"
+      },
+      "id": "c9b92337c88625ee",
+      "name": "Wait For Batch",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.TAKEALOT_API_BASE_URL }}/{{ $env.TAKEALOT_API_VERSION }}/offers/batch/{{ $('Extract Batch Id').first().json.batch_id }}",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.TAKEALOT_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "id": "61468f916ebe6eec",
+      "name": "Poll Batch Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\n        return [{ json: {\n          batch_id: $('Extract Batch Id').first().json.batch_id,\n          status: String(body.status || body.state || 'unknown'),\n          summary: JSON.stringify(body).slice(0, 4000)\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "7334bfc07825b61e",
+      "name": "Batch Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE listing_queue\n        SET status = '{{ $json.status }}', batch_id = '{{ $json.batch_id }}'\n        WHERE batch_id IS NULL AND status = 'pending'",
+        "options": {}
+      },
+      "id": "04824bfcd80712c6",
+      "name": "Update Queue Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {},
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'Listing batch ' + $json.batch_id + ' status: ' + $json.status }) }}"
+      },
+      "id": "375c34b9b421ad18",
+      "name": "Notify Listing Result",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json); return [{ json: { count: rows.length, rows } }];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "7a445a0964c5127a",
+      "name": "Count Rejections",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "rule-1",
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2db6cd7b0d42d3a2",
+      "name": "Any Rejections?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO listing_queue (sku, status, error, created_at)\n        VALUES ('{{ $json.sku }}', 'rejected', '{{ $json.error }}', now())",
+        "options": {}
+      },
+      "id": "a13d7cb0e2560dd6",
+      "name": "Log Rejections",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {},
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'Listing rows rejected: ' + $('Count Rejections').first().json.count }) }}"
+      },
+      "id": "a8c34e5117eeed87",
+      "name": "Notify Rejections",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        140
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ceb30b1938ac649a",
+      "name": "No Rejections",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        400
+      ]
+    }
+  ],
+  "connections": {
+    "Run Listing Batch": {
+      "main": [
+        [
+          {
+            "node": "Read Listing Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Listing Queue": {
+      "main": [
+        [
+          {
+            "node": "Validate Listings",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Collect Rejections",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Listings": {
+      "main": [
+        [
+          {
+            "node": "Log Queue Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Queue Items": {
+      "main": [
+        [
+          {
+            "node": "Submit Offer Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Offer Batch": {
+      "main": [
+        [
+          {
+            "node": "Extract Batch Id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Batch Id": {
+      "main": [
+        [
+          {
+            "node": "Wait For Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait For Batch": {
+      "main": [
+        [
+          {
+            "node": "Poll Batch Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Batch Status": {
+      "main": [
+        [
+          {
+            "node": "Batch Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Result": {
+      "main": [
+        [
+          {
+            "node": "Update Queue Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Queue Status": {
+      "main": [
+        [
+          {
+            "node": "Notify Listing Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Rejections": {
+      "main": [
+        [
+          {
+            "node": "Count Rejections",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count Rejections": {
+      "main": [
+        [
+          {
+            "node": "Any Rejections?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Rejections?": {
+      "main": [
+        [
+          {
+            "node": "Log Rejections",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Rejections",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Rejections": {
+      "main": [
+        [
+          {
+            "node": "Notify Rejections",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "fd6084d4-6960-d1d6-05f2-802a0cacc748",
+  "meta": {},
+  "id": "79ae42a23e800210",
+  "tags": [],
+  "pinData": {}
+}

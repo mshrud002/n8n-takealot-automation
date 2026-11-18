@@ -13,6 +13,8 @@ Terraform-provisioned, self-hosted n8n stack plus version-controlled workflows f
 | Alerts | `04-stock-depletion-alerts.json` | Finds offers at/below the reorder threshold and notifies Slack, email and optionally WhatsApp |
 | Reporting | `05-sales-profit-reporting.json` | Imports daily sales, joins cost prices, calculates revenue/fees/COGS/profit, writes to Postgres, Sheets, Slack and email |
 | Listings | `06-product-listing-automation.json` | Validates a Google Sheets listing queue, submits an offer batch, polls its status and logs rejects |
+| Sourcing | `07-top-products-analysis.json` | Ranks the top-selling SKUs by units over the last 30 days and stores current Takealot prices |
+| Sourcing | `08-wholesale-deal-finder.json` | Scores wholesalers from a Google Sheet and recommends the best deal per top SKU |
 
 Infrastructure (Terraform): n8n main + optional queue-mode worker, PostgreSQL (n8n metadata + a separate `takealot` business database), Redis, Docker network and volumes. Workflow JSON is imported into n8n with the n8n CLI on `terraform apply` and re-imported whenever a file changes.
 
@@ -152,6 +154,36 @@ flowchart LR
   N -->|no| Q["No rejects"]
 ```
 
+### 07 - Top products analysis
+
+```mermaid
+flowchart LR
+  A["Daily 06:30"] --> B["30-day date window"]
+  B --> C["GET /v2/sales"]
+  C --> D["Aggregate by SKU"]
+  D --> E["GET /v2/offers"]
+  E --> F["Normalize current prices"]
+  F --> G["Join and rank by units"]
+  G --> H["Upsert top_products"]
+  H --> I["Build digest"]
+  I --> J["Slack"]
+  J --> K["Email"]
+```
+
+### 08 - Wholesale deal finder
+
+```mermaid
+flowchart LR
+  A["Daily 08:00"] --> B["Read top_products"]
+  B --> C["Read WholesalePrices sheet"]
+  C --> D["Score and rank deals"]
+  D --> E["Upsert sourcing_deals"]
+  E --> F["Log sourcing_deal_history"]
+  F --> G["Build digest"]
+  G --> H["Slack"]
+  H --> I["Email"]
+```
+
 ## Prerequisites
 
 - Docker Engine / Rancher Desktop running on the host
@@ -189,12 +221,26 @@ Imported workflows are **inactive by default** so nothing runs before credential
 | `google_sheets_catalogue_id` | `Catalogue` | `sku`, `cost_price` |
 | `google_sheets_catalogue_id` | `Listings` | `sku`, `barcode`, `selling_price`, `rrp`, `quantity`, `merchant_warehouse_id`, `leadtime_days` |
 | `google_sheets_report_id` | `DailyReport` | created by the append node (`report_date`, `revenue`, `fees`, `cogs`, `profit`, `orders`) |
+| `google_sheets_wholesale_id` | `WholesalePrices` | `sku`, `wholesaler`, `unit_price`, `shipping`, `stock`, `lead_time_days`, `url` |
 
 ## Business database
 
-`sql/001_schema.sql` is applied automatically on apply. Tables: `offers`, `price_history`, `orders`, `sales`, `inventory`, `profit_daily`, `listing_queue`, `automation_log`.
+All files in `sql/` are applied in filename order on apply (`001_schema.sql`, `002_sourcing.sql`). Tables: `offers`, `price_history`, `orders`, `sales`, `inventory`, `profit_daily`, `listing_queue`, `automation_log`, `top_products`, `sourcing_deals`, `sourcing_deal_history`.
 
 The inventory workflow reads `inventory.supplier_stock` and `inventory.reserved_stock`; populate those rows from your supplier/warehouse system (or a separate n8n workflow) for stock sync to have data to push.
+
+### Sourcing workflow details
+
+`07-top-products-analysis.json` aggregates sales from the previous 30 days by SKU, joins the current Takealot selling price, and writes the top `top_products_limit` SKUs to `top_products`.
+
+`08-wholesale-deal-finder.json` reads that ranking and the `WholesalePrices` sheet, then scores each supplier quote per SKU:
+
+- 50% margin score: gross margin percentage divided by `target_margin_percent`
+- 20% price score: lowest unit price for the SKU divided by the quote's unit price
+- 15% stock score: available stock divided by 30-day units sold
+- 15% lead-time score: shorter lead times score higher, zero after 14 days
+
+Landed cost is `unit_price + shipping`; gross margin is `takealot_price - landed_cost`. The highest-scoring quote wins per SKU and is saved to `sourcing_deals`, with each run recorded in `sourcing_deal_history`. Results are sent as a Slack and email digest.
 
 ## Configuration
 
@@ -205,7 +251,7 @@ export TF_VAR_takealot_api_key="..."
 export TF_VAR_postgres_password="..."
 ```
 
-Values are injected into the n8n containers and read in workflows with `{{ $env.NAME }}`.
+Values are injected into the n8n containers and read in workflows with `{{ $env.NAME }}`. Sourcing-specific settings: `google_sheets_wholesale_id`, `top_products_limit` (default 25) and `target_margin_percent` (default 25).
 
 ## Takealot API notes
 
@@ -226,3 +272,4 @@ The generator contains reusable node builders; edit it rather than the generated
 - Price decisions are simple undercut + floor rules; extend `Build Price Decisions` for complex repricing strategies.
 - Xero AccountCode and warehouse ID are placeholders; align them with your chart of accounts and warehouse setup.
 - Email/Slack/WhatsApp nodes fail silently in the UI if their credentials/webhooks are left blank — configure them or remove those nodes.
+- Wholesale quotes come from the `WholesalePrices` sheet only; to track live supplier sites you need to add scraping/API nodes per supplier. Shipping, currency conversion and tax are not modelled beyond the `shipping` column.

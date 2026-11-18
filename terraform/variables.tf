@@ -201,3 +201,21 @@ variable "alert_email" {
   type        = string
   default     = "owner@example.com"
 }
+
+variable "google_sheets_wholesale_id" {
+  description = "Spreadsheet ID with a WholesalePrices tab"
+  type        = string
+  default     = ""
+}
+
+variable "top_products_limit" {
+  description = "Number of top-selling SKUs to analyse for wholesale deals"
+  type        = number
+  default     = 25
+}
+
+variable "target_margin_percent" {
+  description = "Target gross margin used when scoring wholesale deals"
+  type        = number
+  default     = 25
+}

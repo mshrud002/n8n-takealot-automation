@@ -1049,6 +1049,353 @@ def listing_automation():
     write(b, "06-product-listing-automation")
 
 
+# ---------------------------------------------------------------------------
+# 07 - Top selling products (last 30 days by units)
+# ---------------------------------------------------------------------------
+def top_products_analysis():
+    b = Builder("07 - Top Products Analysis")
+    schedule(b, "Daily 06:30", "30 6 * * *", (0, 0))
+    code(
+        b,
+        "Thirty Day Window",
+        """
+        const now = new Date();
+        const start = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+        return [{ json: {
+          start_date: start.toISOString().slice(0, 10),
+          end_date: now.toISOString().slice(0, 10)
+        }}];
+        """,
+        (220, 0),
+    )
+    http(
+        b,
+        "Fetch Sales",
+        "GET",
+        API + "/sales",
+        (440, 0),
+        query={
+            "start_date": "={{ $json.start_date }}",
+            "end_date": "={{ $json.end_date }}",
+        },
+        headers=takealot_headers(),
+    )
+    code(
+        b,
+        "Aggregate By Sku",
+        """
+        const body = $input.first().json;
+        const sales = body.sales || body.data?.sales || body.results || [];
+        const map = {};
+        for (const s of sales) {
+          const sku = String(s.sku || s.merchant_sku || '').trim();
+          if (!sku) continue;
+          const qty = Number(s.quantity || s.units || 0);
+          const rev = Number(s.revenue || s.total || s.item_price || 0);
+          const row = map[sku] || (map[sku] = {
+            sku,
+            product_title: String(s.product_title || s.title || ''),
+            offer_id: Number(s.offer_id || 0),
+            units_sold: 0,
+            revenue: 0
+          });
+          row.units_sold += qty;
+          row.revenue += rev;
+        }
+        const rows = Object.values(map).map(r => ({ json: {
+          sku: r.sku,
+          product_title: r.product_title,
+          offer_id: r.offer_id,
+          units_sold: r.units_sold,
+          revenue: Math.round(r.revenue * 100) / 100,
+          avg_selling_price: r.units_sold ? Math.round(r.revenue / r.units_sold * 100) / 100 : 0
+        }}));
+        rows.sort((a, b) => b.json.units_sold - a.json.units_sold);
+        return rows;
+        """,
+        (660, 0),
+    )
+    http(
+        b,
+        "Fetch My Offers",
+        "GET",
+        API + "/offers",
+        (880, 0),
+        query={"page_number": "1", "page_size": "100"},
+        headers=takealot_headers(),
+    )
+    code(
+        b,
+        "Normalize Current Prices",
+        """
+        const body = $input.first().json;
+        const offers = body.offers || body.data?.offers || [];
+        return offers.map(o => ({ json: {
+          sku: String(o.sku || o.merchant_sku || '').trim(),
+          offer_id: Number(o.offer_id || o.id || 0),
+          product_title: String(o.title || o.product_title || ''),
+          takealot_price: Number(o.selling_price || 0)
+        }}));
+        """,
+        (1100, 0),
+    )
+    code(
+        b,
+        "Join And Rank",
+        """
+        const agg = $('Aggregate By Sku').all().map(i => i.json);
+        const prices = {};
+        for (const p of $input.all().map(i => i.json)) {
+          if (p.sku) prices[p.sku] = p;
+        }
+        const limit = Number($env.TOP_PRODUCTS_LIMIT || 25);
+        const window = $('Thirty Day Window').first().json;
+        const rows = agg.map(a => {
+          const p = prices[a.sku] || {};
+          return { json: {
+            sku: a.sku,
+            product_title: p.product_title || a.product_title,
+            offer_id: p.offer_id || a.offer_id,
+            units_sold: a.units_sold,
+            revenue: a.revenue,
+            avg_selling_price: a.avg_selling_price,
+            takealot_price: p.takealot_price || a.avg_selling_price,
+            window_start: window.start_date,
+            window_end: window.end_date
+          }};
+        });
+        rows.sort((a, b) => b.json.units_sold - a.json.units_sold);
+        return rows.slice(0, limit).map((r, i) => ({ json: { ...r.json, rank: i + 1 } }));
+        """,
+        (1320, 0),
+    )
+    pg(
+        b,
+        "Upsert Top Products",
+        """
+        INSERT INTO top_products (sku, product_title, offer_id, units_sold, revenue,
+                                  avg_selling_price, takealot_price, window_start, window_end, rank, updated_at)
+        VALUES ('{{ $json.sku }}', '{{ $json.product_title.replace(/'/g, "''") }}', {{ $json.offer_id }},
+                {{ $json.units_sold }}, {{ $json.revenue }}, {{ $json.avg_selling_price }},
+                {{ $json.takealot_price }}, '{{ $json.window_start }}', '{{ $json.window_end }}',
+                {{ $json.rank }}, now())
+        ON CONFLICT (sku) DO UPDATE SET
+          product_title = EXCLUDED.product_title,
+          offer_id = EXCLUDED.offer_id,
+          units_sold = EXCLUDED.units_sold,
+          revenue = EXCLUDED.revenue,
+          avg_selling_price = EXCLUDED.avg_selling_price,
+          takealot_price = EXCLUDED.takealot_price,
+          window_start = EXCLUDED.window_start,
+          window_end = EXCLUDED.window_end,
+          rank = EXCLUDED.rank,
+          updated_at = now()
+        """,
+        (1540, 0),
+    )
+    code(
+        b,
+        "Build Top Products Digest",
+        """
+        const rows = $('Join And Rank').all().map(i => i.json).slice(0, 10);
+        const lines = rows.map(r => r.rank + '. ' + r.sku + ' - ' + r.product_title +
+          ': ' + r.units_sold + ' units, R' + r.revenue);
+        return [{ json: {
+          count: rows.length,
+          text: 'Top Takealot sellers (last 30 days)\\n' + lines.join('\\n'),
+          html: '<h2>Top sellers - last 30 days</h2><ol>' +
+            lines.map(l => '<li>' + l + '</li>').join('') + '</ol>'
+        }}];
+        """,
+        (1760, 0),
+    )
+    slack(b, "Notify Top Products", "$json.text", (1980, 0))
+    email(
+        b,
+        "Email Top Products",
+        "={{ 'Top Takealot sellers - ' + $json.count + ' products' }}",
+        "={{ $json.html }}",
+        (2200, 0),
+    )
+    b.connect("Daily 06:30", "Thirty Day Window")
+    b.connect("Thirty Day Window", "Fetch Sales")
+    b.connect("Fetch Sales", "Aggregate By Sku")
+    b.connect("Aggregate By Sku", "Fetch My Offers")
+    b.connect("Fetch My Offers", "Normalize Current Prices")
+    b.connect("Normalize Current Prices", "Join And Rank")
+    b.connect("Join And Rank", "Upsert Top Products")
+    b.connect("Upsert Top Products", "Build Top Products Digest")
+    b.connect("Build Top Products Digest", "Notify Top Products")
+    b.connect("Notify Top Products", "Email Top Products")
+    write(b, "07-top-products-analysis")
+
+
+# ---------------------------------------------------------------------------
+# 08 - Wholesale deal finder for the top sellers
+# ---------------------------------------------------------------------------
+def wholesale_deal_finder():
+    b = Builder("08 - Wholesale Deal Finder")
+    schedule(b, "Daily 08:00", "0 8 * * *", (0, 0))
+    pg(
+        b,
+        "Read Top Products",
+        """
+        SELECT sku, product_title, rank, units_sold, takealot_price
+        FROM top_products
+        WHERE rank <= {{ $env.TOP_PRODUCTS_LIMIT }}
+        ORDER BY rank
+        """,
+        (220, 0),
+    )
+    gs(
+        b,
+        "Wholesale Prices",
+        "read",
+        "GOOGLE_SHEETS_WHOLESALE_ID",
+        "WholesalePrices",
+        (440, 0),
+    )
+    code(
+        b,
+        "Rank Deals",
+        """
+        const products = $('Read Top Products').all().map(i => i.json);
+        const offers = $input.all().map(i => i.json);
+        const bySku = {};
+        for (const o of offers) {
+          const sku = String(o.sku || '').trim();
+          if (!sku) continue;
+          (bySku[sku] || (bySku[sku] = [])).push(o);
+        }
+        const target = Number($env.TARGET_MARGIN_PERCENT || 25);
+        const clamp = n => Math.max(0, Math.min(1, n));
+        const out = [];
+        for (const p of products) {
+          const candidates = bySku[p.sku] || [];
+          const sell = Number(p.takealot_price || 0);
+          if (!candidates.length || sell <= 0) continue;
+          const positive = candidates
+            .map(c => Number(c.unit_price || 0))
+            .filter(n => n > 0);
+          const minPrice = positive.length ? Math.min(...positive) : 0;
+          const ranked = candidates.map(c => {
+            const unit = Number(c.unit_price || 0);
+            const shipping = Number(c.shipping || 0);
+            const stock = Number(c.stock || c.available_stock || 0);
+            const lead = Number(c.lead_time_days || c.lead_time || 0);
+            const landed = unit + shipping;
+            const margin = sell - landed;
+            const marginPct = (margin / sell) * 100;
+            const marginScore = clamp(marginPct / target);
+            const priceScore = unit > 0 && minPrice > 0 ? clamp(minPrice / unit) : 0;
+            const stockScore = clamp(stock / Math.max(Number(p.units_sold || 0), 1));
+            const leadScore = clamp((14 - lead) / 14);
+            const score = 0.5 * marginScore + 0.2 * priceScore +
+                          0.15 * stockScore + 0.15 * leadScore;
+            return {
+              sku: p.sku,
+              product_title: String(p.product_title || ''),
+              product_rank: Number(p.rank || 0),
+              units_sold: Number(p.units_sold || 0),
+              takealot_price: sell,
+              best_wholesaler: String(c.wholesaler || c.supplier || ''),
+              unit_price: unit,
+              shipping: shipping,
+              landed_cost: landed,
+              gross_margin: Math.round(margin * 100) / 100,
+              margin_pct: Math.round(marginPct * 100) / 100,
+              available_stock: stock,
+              lead_time_days: lead,
+              supplier_url: String(c.url || c.supplier_url || ''),
+              score: Math.round(score * 10000) / 10000
+            };
+          }).sort((a, b) => b.score - a.score);
+          const best = ranked[0];
+          best.alternatives = ranked.slice(1, 4);
+          out.push({ json: best });
+        }
+        return out;
+        """,
+        (660, 0),
+    )
+    pg(
+        b,
+        "Upsert Sourcing Deals",
+        """
+        INSERT INTO sourcing_deals (sku, product_title, product_rank, units_sold, takealot_price,
+                                    best_wholesaler, unit_price, shipping, landed_cost, gross_margin,
+                                    margin_pct, available_stock, lead_time_days, supplier_url, score, computed_at)
+        VALUES ('{{ $json.sku }}', '{{ $json.product_title.replace(/'/g, "''") }}', {{ $json.product_rank }},
+                {{ $json.units_sold }}, {{ $json.takealot_price }},
+                '{{ $json.best_wholesaler.replace(/'/g, "''") }}', {{ $json.unit_price }},
+                {{ $json.shipping }}, {{ $json.landed_cost }}, {{ $json.gross_margin }},
+                {{ $json.margin_pct }}, {{ $json.available_stock }}, {{ $json.lead_time_days }},
+                '{{ $json.supplier_url.replace(/'/g, "''") }}', {{ $json.score }}, now())
+        ON CONFLICT (sku) DO UPDATE SET
+          product_title = EXCLUDED.product_title,
+          product_rank = EXCLUDED.product_rank,
+          units_sold = EXCLUDED.units_sold,
+          takealot_price = EXCLUDED.takealot_price,
+          best_wholesaler = EXCLUDED.best_wholesaler,
+          unit_price = EXCLUDED.unit_price,
+          shipping = EXCLUDED.shipping,
+          landed_cost = EXCLUDED.landed_cost,
+          gross_margin = EXCLUDED.gross_margin,
+          margin_pct = EXCLUDED.margin_pct,
+          available_stock = EXCLUDED.available_stock,
+          lead_time_days = EXCLUDED.lead_time_days,
+          supplier_url = EXCLUDED.supplier_url,
+          score = EXCLUDED.score,
+          computed_at = now()
+        """,
+        (880, 0),
+    )
+    pg(
+        b,
+        "Log Deal History",
+        """
+        INSERT INTO sourcing_deal_history (sku, best_wholesaler, unit_price, landed_cost, margin_pct, score, computed_at)
+        VALUES ('{{ $json.sku }}', '{{ $json.best_wholesaler.replace(/'/g, "''") }}', {{ $json.unit_price }},
+                {{ $json.landed_cost }}, {{ $json.margin_pct }}, {{ $json.score }}, now())
+        """,
+        (1100, 0),
+    )
+    code(
+        b,
+        "Build Sourcing Digest",
+        """
+        const rows = $('Rank Deals').all().map(i => i.json).slice(0, 10);
+        const lines = rows.map(r => r.product_rank + '. ' + r.sku + ' -> ' + r.best_wholesaler +
+          ': cost R' + r.landed_cost + ' vs R' + r.takealot_price +
+          ' | margin ' + r.margin_pct + '% | score ' + r.score);
+        return [{ json: {
+          count: rows.length,
+          text: 'Best wholesale deals for top sellers\\n' + lines.join('\\n'),
+          html: '<h2>Best wholesale deals</h2><ol>' +
+            lines.map(l => '<li>' + l + '</li>').join('') + '</ol>'
+        }}];
+        """,
+        (1320, 0),
+    )
+    slack(b, "Notify Sourcing Deals", "$json.text", (1540, 0))
+    email(
+        b,
+        "Email Sourcing Deals",
+        "={{ 'Wholesale deals for ' + $json.count + ' top products' }}",
+        "={{ $json.html }}",
+        (1760, 0),
+    )
+    b.connect("Daily 08:00", "Read Top Products")
+    b.connect("Read Top Products", "Wholesale Prices")
+    b.connect("Wholesale Prices", "Rank Deals")
+    b.connect("Rank Deals", "Upsert Sourcing Deals")
+    b.connect("Upsert Sourcing Deals", "Log Deal History")
+    b.connect("Log Deal History", "Build Sourcing Digest")
+    b.connect("Build Sourcing Digest", "Notify Sourcing Deals")
+    b.connect("Notify Sourcing Deals", "Email Sourcing Deals")
+    write(b, "08-wholesale-deal-finder")
+
+
 if __name__ == "__main__":
     health_check()
     price_monitoring()
@@ -1057,3 +1404,5 @@ if __name__ == "__main__":
     stock_alerts()
     profit_reporting()
     listing_automation()
+    top_products_analysis()
+    wholesale_deal_finder()

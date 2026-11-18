@@ -10,3 +10,6 @@ postgres_port          = 5432
 low_stock_threshold    = 5
 price_min_margin_percent = 15
 price_undercut_cents   = 100
+google_sheets_wholesale_id = ""
+top_products_limit     = 25
+target_margin_percent  = 25

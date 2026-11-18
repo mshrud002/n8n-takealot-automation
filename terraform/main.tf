@@ -1,7 +1,9 @@
 locals {
   redis_password = var.redis_password != "" ? var.redis_password : random_password.redis.result
   workflow_path  = abspath("${path.module}/${var.workflow_dir}")
-  schema_path    = abspath("${path.module}/../sql/001_schema.sql")
+  sql_path       = abspath("${path.module}/../sql")
+  sql_files      = sort(fileset(local.sql_path, "*.sql"))
+  sql_hash       = join(",", [for f in local.sql_files : filemd5("${local.sql_path}/${f}")])
   workflow_hash  = join(",", [for f in fileset(local.workflow_path, "*.json") : filemd5("${local.workflow_path}/${f}")])
 
   common_env = [
@@ -41,6 +43,9 @@ locals {
     "GOOGLE_SHEETS_COMPETITORS_ID=${var.google_sheets_competitors_id}",
     "GOOGLE_SHEETS_CATALOGUE_ID=${var.google_sheets_catalogue_id}",
     "GOOGLE_SHEETS_REPORT_ID=${var.google_sheets_report_id}",
+    "GOOGLE_SHEETS_WHOLESALE_ID=${var.google_sheets_wholesale_id}",
+    "TOP_PRODUCTS_LIMIT=${var.top_products_limit}",
+    "TARGET_MARGIN_PERCENT=${var.target_margin_percent}",
     "XERO_TENANT_ID=${var.xero_tenant_id}",
     "SMTP_FROM_EMAIL=${var.smtp_from_email}",
     "ALERT_EMAIL=${var.alert_email}",
@@ -244,7 +249,7 @@ resource "docker_container" "worker" {
 
 resource "null_resource" "business_db" {
   triggers = {
-    schema = filemd5(local.schema_path)
+    schema = local.sql_hash
     db     = var.business_db
   }
 
@@ -259,7 +264,12 @@ resource "null_resource" "business_db" {
   }
 
   provisioner "local-exec" {
-    command = "docker exec -i ${var.postgres_container_name} psql -v ON_ERROR_STOP=1 -U ${var.postgres_user} -d ${var.business_db} < '${local.schema_path}'"
+    command = <<-EOT
+      set -e
+      for f in "${local.sql_path}"/*.sql; do
+        docker exec -i ${var.postgres_container_name} psql -v ON_ERROR_STOP=1 -U ${var.postgres_user} -d ${var.business_db} < "$$f"
+      done
+    EOT
   }
 
   depends_on = [docker_container.postgres]

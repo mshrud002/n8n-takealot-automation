@@ -1,0 +1,260 @@
+{
+  "name": "08 - Wholesale Deal Finder",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "6416fcdf310a4c2f",
+      "name": "Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT sku, product_title, rank, units_sold, takealot_price\n        FROM top_products\n        WHERE rank <= {{ $env.TOP_PRODUCTS_LIMIT }}\n        ORDER BY rank",
+        "options": {}
+      },
+      "id": "5a7c81862afd9214",
+      "name": "Read Top Products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_WHOLESALE_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "WholesalePrices",
+          "mode": "name"
+        },
+        "options": {},
+        "dataLocationOnSheet": {
+          "rangeDefinition": "detectAutomatically"
+        }
+      },
+      "id": "83d733e47a38f00d",
+      "name": "Wholesale Prices",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const products = $('Read Top Products').all().map(i => i.json);\n        const offers = $input.all().map(i => i.json);\n        const bySku = {};\n        for (const o of offers) {\n          const sku = String(o.sku || '').trim();\n          if (!sku) continue;\n          (bySku[sku] || (bySku[sku] = [])).push(o);\n        }\n        const target = Number($env.TARGET_MARGIN_PERCENT || 25);\n        const clamp = n => Math.max(0, Math.min(1, n));\n        const out = [];\n        for (const p of products) {\n          const candidates = bySku[p.sku] || [];\n          const sell = Number(p.takealot_price || 0);\n          if (!candidates.length || sell <= 0) continue;\n          const positive = candidates\n            .map(c => Number(c.unit_price || 0))\n            .filter(n => n > 0);\n          const minPrice = positive.length ? Math.min(...positive) : 0;\n          const ranked = candidates.map(c => {\n            const unit = Number(c.unit_price || 0);\n            const shipping = Number(c.shipping || 0);\n            const stock = Number(c.stock || c.available_stock || 0);\n            const lead = Number(c.lead_time_days || c.lead_time || 0);\n            const landed = unit + shipping;\n            const margin = sell - landed;\n            const marginPct = (margin / sell) * 100;\n            const marginScore = clamp(marginPct / target);\n            const priceScore = unit > 0 && minPrice > 0 ? clamp(minPrice / unit) : 0;\n            const stockScore = clamp(stock / Math.max(Number(p.units_sold || 0), 1));\n            const leadScore = clamp((14 - lead) / 14);\n            const score = 0.5 * marginScore + 0.2 * priceScore +\n                          0.15 * stockScore + 0.15 * leadScore;\n            return {\n              sku: p.sku,\n              product_title: String(p.product_title || ''),\n              product_rank: Number(p.rank || 0),\n              units_sold: Number(p.units_sold || 0),\n              takealot_price: sell,\n              best_wholesaler: String(c.wholesaler || c.supplier || ''),\n              unit_price: unit,\n              shipping: shipping,\n              landed_cost: landed,\n              gross_margin: Math.round(margin * 100) / 100,\n              margin_pct: Math.round(marginPct * 100) / 100,\n              available_stock: stock,\n              lead_time_days: lead,\n              supplier_url: String(c.url || c.supplier_url || ''),\n              score: Math.round(score * 10000) / 10000\n            };\n          }).sort((a, b) => b.score - a.score);\n          const best = ranked[0];\n          best.alternatives = ranked.slice(1, 4);\n          out.push({ json: best });\n        }\n        return out;",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "51dbb7b066a481b4",
+      "name": "Rank Deals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sourcing_deals (sku, product_title, product_rank, units_sold, takealot_price,\n                                    best_wholesaler, unit_price, shipping, landed_cost, gross_margin,\n                                    margin_pct, available_stock, lead_time_days, supplier_url, score, computed_at)\n        VALUES ('{{ $json.sku }}', '{{ $json.product_title.replace(/'/g, \"''\") }}', {{ $json.product_rank }},\n                {{ $json.units_sold }}, {{ $json.takealot_price }},\n                '{{ $json.best_wholesaler.replace(/'/g, \"''\") }}', {{ $json.unit_price }},\n                {{ $json.shipping }}, {{ $json.landed_cost }}, {{ $json.gross_margin }},\n                {{ $json.margin_pct }}, {{ $json.available_stock }}, {{ $json.lead_time_days }},\n                '{{ $json.supplier_url.replace(/'/g, \"''\") }}', {{ $json.score }}, now())\n        ON CONFLICT (sku) DO UPDATE SET\n          product_title = EXCLUDED.product_title,\n          product_rank = EXCLUDED.product_rank,\n          units_sold = EXCLUDED.units_sold,\n          takealot_price = EXCLUDED.takealot_price,\n          best_wholesaler = EXCLUDED.best_wholesaler,\n          unit_price = EXCLUDED.unit_price,\n          shipping = EXCLUDED.shipping,\n          landed_cost = EXCLUDED.landed_cost,\n          gross_margin = EXCLUDED.gross_margin,\n          margin_pct = EXCLUDED.margin_pct,\n          available_stock = EXCLUDED.available_stock,\n          lead_time_days = EXCLUDED.lead_time_days,\n          supplier_url = EXCLUDED.supplier_url,\n          score = EXCLUDED.score,\n          computed_at = now()",
+        "options": {}
+      },
+      "id": "2266725ad606f061",
+      "name": "Upsert Sourcing Deals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sourcing_deal_history (sku, best_wholesaler, unit_price, landed_cost, margin_pct, score, computed_at)\n        VALUES ('{{ $json.sku }}', '{{ $json.best_wholesaler.replace(/'/g, \"''\") }}', {{ $json.unit_price }},\n                {{ $json.landed_cost }}, {{ $json.margin_pct }}, {{ $json.score }}, now())",
+        "options": {}
+      },
+      "id": "78a4c4d83a5f07f7",
+      "name": "Log Deal History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $('Rank Deals').all().map(i => i.json).slice(0, 10);\n        const lines = rows.map(r => r.product_rank + '. ' + r.sku + ' -> ' + r.best_wholesaler +\n          ': cost R' + r.landed_cost + ' vs R' + r.takealot_price +\n          ' | margin ' + r.margin_pct + '% | score ' + r.score);\n        return [{ json: {\n          count: rows.length,\n          text: 'Best wholesale deals for top sellers\\n' + lines.join('\\n'),\n          html: '<h2>Best wholesale deals</h2><ol>' +\n            lines.map(l => '<li>' + l + '</li>').join('') + '</ol>'\n        }}];",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "26a5a8d1f4644ca6",
+      "name": "Build Sourcing Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {},
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.text }) }}"
+      },
+      "id": "63a27acb20f2b202",
+      "name": "Notify Sourcing Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_FROM_EMAIL }}",
+        "toEmail": "={{ $env.ALERT_EMAIL }}",
+        "subject": "={{ 'Wholesale deals for ' + $json.count + ' top products' }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {}
+      },
+      "id": "df67abc009a9853c",
+      "name": "Email Sourcing Deals",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1760,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 08:00": {
+      "main": [
+        [
+          {
+            "node": "Read Top Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Top Products": {
+      "main": [
+        [
+          {
+            "node": "Wholesale Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wholesale Prices": {
+      "main": [
+        [
+          {
+            "node": "Rank Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rank Deals": {
+      "main": [
+        [
+          {
+            "node": "Upsert Sourcing Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Sourcing Deals": {
+      "main": [
+        [
+          {
+            "node": "Log Deal History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Deal History": {
+      "main": [
+        [
+          {
+            "node": "Build Sourcing Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Sourcing Digest": {
+      "main": [
+        [
+          {
+            "node": "Notify Sourcing Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Sourcing Deals": {
+      "main": [
+        [
+          {
+            "node": "Email Sourcing Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "bcdd28e4-5941-d05b-7a38-d76dbd92e80b",
+  "meta": {},
+  "id": "2f3e110a9a38c6bc",
+  "tags": [],
+  "pinData": {}
+}

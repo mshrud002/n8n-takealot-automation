@@ -16,6 +16,142 @@ Terraform-provisioned, self-hosted n8n stack plus version-controlled workflows f
 
 Infrastructure (Terraform): n8n main + optional queue-mode worker, PostgreSQL (n8n metadata + a separate `takealot` business database), Redis, Docker network and volumes. Workflow JSON is imported into n8n with the n8n CLI on `terraform apply` and re-imported whenever a file changes.
 
+## Flow diagrams
+
+### System and code flow
+
+```mermaid
+flowchart TB
+  GEN["scripts/generate_workflows.py"] --> JSON["workflows/*.json"]
+  TF["terraform/main.tf"] --> IMPORT["n8n import:workflow"]
+  JSON -->|mounted at /workflows| IMPORT
+  TF --> INFRA["Docker: n8n main + worker, Postgres, Redis"]
+  IMPORT --> DB[("n8n database")]
+  INFRA --> DB
+
+  subgraph Runtime
+    API["Takealot Seller API"] --> N8N["n8n workflows"]
+    SHEETS["Google Sheets"] --> N8N
+    INV["inventory table"] --> N8N
+    N8N --> BIZ[("takealot Postgres")]
+    N8N --> NOTIFY["Slack / Email / WhatsApp"]
+    N8N --> XERO["Xero"]
+  end
+
+  DB --> N8N
+```
+
+### 00 - API health check
+
+```mermaid
+flowchart LR
+  A["Manual trigger"] --> B["GET /offers/count"]
+  B --> C["Summarise result"]
+  C --> D["Slack notification"]
+```
+
+### 01 - Price and competitor monitoring
+
+```mermaid
+flowchart LR
+  A["Daily 06:00"] --> B["GET /v2/offers"]
+  B --> C["Normalize offers"]
+  C --> D["Upsert offers"]
+  D --> E["Read CompetitorPrices sheet"]
+  E --> F["Build price decisions"]
+  F --> G{"Needs reprice?"}
+  G -->|yes| H["PATCH offer price"]
+  H --> I["Log price_history"]
+  I --> J["Slack alert"]
+  G -->|no| K["No action"]
+```
+
+### 02 - Order processing
+
+```mermaid
+flowchart LR
+  A["Every 15 minutes"] --> B["Date window"]
+  B --> C["GET /v1/sales/orders"]
+  C --> D["Normalize orders"]
+  D --> E["Upsert orders"]
+  E --> F["Order summary"]
+  F --> G{"New orders?"}
+  G -->|yes| H["Slack digest"]
+  H --> I["Email digest"]
+  I --> J["Xero invoice"]
+  G -->|no| K["No action"]
+```
+
+### 03 - Inventory sync
+
+```mermaid
+flowchart LR
+  A["Hourly"] --> B["Read inventory table"]
+  B --> C["GET /v2/offers"]
+  C --> D["Reconcile stock"]
+  D --> E["Count updates"]
+  E --> F{"Differences?"}
+  F -->|yes| G["POST /offers/batch"]
+  G --> H["Flatten updates"]
+  H --> I["Update inventory"]
+  I --> J["Log automation_log"]
+  J --> K["Slack notification"]
+  F -->|no| L["In sync"]
+```
+
+### 04 - Stock depletion alerts
+
+```mermaid
+flowchart LR
+  A["Every 2 hours"] --> B["Low stock query"]
+  B --> C["Format alerts"]
+  C --> D{"Any low stock?"}
+  D -->|yes| E["Slack"]
+  E --> F["Email"]
+  F --> G{"WhatsApp configured?"}
+  G -->|yes| H["WhatsApp message"]
+  G -->|no| I["Skip WhatsApp"]
+  D -->|no| J["Stock healthy"]
+```
+
+### 05 - Sales and profit reporting
+
+```mermaid
+flowchart LR
+  A["Daily 07:00"] --> B["Yesterday range"]
+  B --> C["GET /v2/sales"]
+  C --> D["Normalize sales"]
+  D --> E["Upsert sales"]
+  E --> F["Read Catalogue cost prices"]
+  F --> G["Compute daily profit"]
+  G --> H["Save profit_daily"]
+  H --> I["Append DailyReport row"]
+  I --> J["Slack notification"]
+  J --> K["Email report"]
+```
+
+### 06 - Product listing automation
+
+```mermaid
+flowchart LR
+  A["Manual trigger"] --> B["Read Listings sheet"]
+  B --> C["Validate listings"]
+  B --> D["Collect rejections"]
+  C --> E["Log queue items"]
+  E --> F["POST /offers/batch"]
+  F --> G["Extract batch id"]
+  G --> H["Wait 30 seconds"]
+  H --> I["Poll batch status"]
+  I --> J["Batch result"]
+  J --> K["Update listing_queue"]
+  K --> L["Slack result"]
+  D --> M["Count rejections"]
+  M --> N{"Any rejections?"}
+  N -->|yes| O["Log rejects"]
+  O --> P["Slack rejects"]
+  N -->|no| Q["No rejects"]
+```
+
 ## Prerequisites
 
 - Docker Engine / Rancher Desktop running on the host
